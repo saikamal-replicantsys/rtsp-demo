@@ -12,14 +12,14 @@ gi.require_version('GstWebRTC','1.0')
 gi.require_version('GstSdp',   '1.0')
 from gi.repository import Gst, GstWebRTC, GstSdp, GObject
 
-# ─── Logging ─────────────────────────────────────────
+# ─────────── Configure Logging ───────────
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("rtsp-ws")
 
-# ─── Load configuration ───────────────────────────────
+# ─────────── Load config.yaml ───────────
 THIS_DIR  = os.path.dirname(__file__)
 CONF_PATH = os.path.join(THIS_DIR, "config.yaml")
 with open(CONF_PATH, "r") as f:
@@ -35,7 +35,7 @@ logger.info(f"RTSP URL    : {RTSP_URL}")
 logger.info(f"STUN Server : {STUN_SERVER}")
 logger.info(f"CSV Log     : {CSV_LOG} (stub)")
 
-# ─── GStreamer Initialization ────────────────────────
+# ─────────── GStreamer Initialization ───────────
 Gst.init(None)
 GObject.threads_init()
 
@@ -44,7 +44,7 @@ webrtcbin   = None
 pending_ice = []
 sdp_answer  = None
 
-# ─── GStreamer Callbacks ─────────────────────────────
+# ─────────── GStreamer Callbacks ───────────
 def on_ice_candidate(elem, mlineindex, candidate):
     logger.debug(f"[GStreamer] ICE candidate mline={mlineindex}: {candidate}")
     pending_ice.append({
@@ -72,14 +72,14 @@ def _on_decode_pad(decode, pad):
         return
     pad.link(sink)
 
-# ─── Build & Link Pipeline ───────────────────────────
+# ─────────── Build & Link Pipeline ───────────
 def build_pipeline():
     global pipeline, webrtcbin
 
     logger.info("Building GStreamer pipeline…")
     pipeline = Gst.Pipeline.new("webrtc-pipeline")
 
-    # Create elements
+    # 1) Create elements
     src       = Gst.ElementFactory.make("rtspsrc",     "rtspsrc")
     decode    = Gst.ElementFactory.make("decodebin",   "decodebin")
     convert   = Gst.ElementFactory.make("videoconvert","convert")
@@ -89,59 +89,60 @@ def build_pipeline():
 
     if not all((pipeline, src, decode, convert, encoder, payloader, webrtcbin)):
         logger.critical("Failed to create one or more GStreamer elements")
-        raise RuntimeError("Element creation failure")
+        raise RuntimeError("GStreamer element creation failure")
 
-    # Configure elements
+    # 2) Configure
     src.set_property("location", RTSP_URL)
     src.set_property("latency", 200)
     encoder.set_property("tune", "zerolatency")
     payloader.set_property("config-interval", 1)
     webrtcbin.set_property("stun-server", STUN_SERVER)
 
-    # Add elements to pipeline
+    # 3) Add to pipeline
     for el in (src, decode, convert, encoder, payloader, webrtcbin):
         pipeline.add(el)
 
-    # Static links
+    # 4) Static linking: convert → encoder → payloader
     convert.link(encoder)
     encoder.link(payloader)
 
-    # Dynamic RTSP decode
-    src.connect("pad-added",     _on_rtsp_pad)
-    decode.connect("pad-added",  _on_decode_pad)
+    # 5) Dynamic RTSP decode
+    src.connect("pad-added",    _on_rtsp_pad)
+    decode.connect("pad-added", _on_decode_pad)
 
-    # Discover and log pad templates for webrtcbin
+    # 6) Discover pad templates on webrtcbin
     templates = webrtcbin.get_pad_template_list()
     logger.debug("webrtcbin pad templates:")
     for tmpl in templates:
-        logger.debug("  • %s", tmpl.get_name_template())
+        # use the correct property name
+        name = tmpl.name_template
+        logger.debug(f"  • {name}")
 
-    # Pick the sink template named "sink_%u" if available, else first containing "sink"
+    # 7) Select appropriate sink template
     pad_template = None
     for tmpl in templates:
-        name = tmpl.get_name_template()
-        if name == "sink_%u":
+        if tmpl.name_template == "sink_%u":
             pad_template = tmpl
             break
     if not pad_template:
         for tmpl in templates:
-            if "sink" in tmpl.get_name_template():
+            if "sink" in tmpl.name_template:
                 pad_template = tmpl
-                logger.warning("Using fallback pad template %s", tmpl.get_name_template())
+                logger.warning("Falling back to pad template %s", tmpl.name_template)
                 break
 
     if not pad_template:
-        logger.critical("No suitable sink pad template found on webrtcbin")
+        logger.critical("No 'sink' pad template found")
         raise RuntimeError("Missing webrtcbin sink pad template")
 
-    # Request a sink pad
+    # 8) Request the sink pad
     pad_sink = webrtcbin.request_pad(pad_template, None)
     if not pad_sink:
         logger.critical("webrtcbin.request_pad() failed for template %s",
-                        pad_template.get_name_template())
-        raise RuntimeError("Pad request failure")
+                        pad_template.name_template)
+        raise RuntimeError("webrtcbin.request_pad() failure")
 
-    # Link payloader → webrtcbin sink
+    # 9) Link payloader src → webrtcbin sink
     pad_src = payloader.get_static_pad("src")
     if not pad_src:
         logger.critical("payloader missing src pad")
@@ -150,16 +151,16 @@ def build_pipeline():
     ret = pad_src.link(pad_sink)
     if ret != Gst.PadLinkReturn.OK:
         logger.critical("Failed to link payloader → webrtcbin (%s)", ret)
-        raise RuntimeError("Pad link failure")
+        raise RuntimeError("Pad linking failure")
 
-    # ICE callback
+    # 10) ICE candidate callback
     webrtcbin.connect("on-ice-candidate", on_ice_candidate)
 
-    logger.info("GStreamer pipeline built and linked")
+    logger.info("Pipeline built and linked successfully")
     return pipeline
 
 def gst_main():
-    """Run GStreamer's mainloop in a background thread."""
+    """Run GStreamer's main loop in its own thread."""
     try:
         p = build_pipeline()
         p.set_state(Gst.State.PLAYING)
@@ -168,7 +169,7 @@ def gst_main():
     except Exception:
         logger.exception("Error in GStreamer main loop")
 
-# ─── HTTP Signaling Endpoints ───────────────────────────
+# ─────────── HTTP Signaling Endpoints ───────────
 routes = web.RouteTableDef()
 
 @routes.post("/stream/offer")
@@ -179,13 +180,13 @@ async def handle_offer(request):
     sdp   = offer["sdp"]
     logger.info("Received /stream/offer")
 
-    # Parse and set remote SDP
+    # Parse & set remote SDP
     msg, _ = GstSdp.SDPMessage.new()
     GstSdp.sdp_message_parse_buffer(sdp.encode(), msg)
     webrtcbin.emit("set-remote-description",
                    GstWebRTC.WebRTCSessionDescription.new(
                        GstWebRTC.WebRTCSDPType.OFFER, msg))
-    logger.debug("Remote description set")
+    logger.debug("Remote SDP set")
 
     # Create answer
     def on_answer(promise, _, __):
@@ -193,7 +194,7 @@ async def handle_offer(request):
         reply      = promise.get_reply()
         answer_obj = reply["answer"]
         sdp_answer = answer_obj.sdp.as_text()
-        logger.debug("SDP answer ready")
+        logger.debug("SDP answer generated")
 
     promise = Gst.Promise.new_with_change_func(on_answer, None, None)
     webrtcbin.emit("create-answer", None, promise)
@@ -206,7 +207,7 @@ async def handle_offer(request):
     pending_ice.clear()
     sdp_answer = None
 
-    logger.info("Sending SDP answer + ICE candidates")
+    logger.info("Replying with SDP answer + ICE candidates")
     return web.json_response(resp)
 
 @routes.post("/stream/ice-candidate")
@@ -221,7 +222,7 @@ async def handle_ice(request):
 
 @routes.post("/stream/stop")
 async def handle_stop(request):
-    logger.info("Received /stream/stop → NULL pipeline")
+    logger.info("Received /stream/stop, setting pipeline to NULL")
     pipeline.set_state(Gst.State.NULL)
     return web.json_response({"success": True})
 
@@ -237,7 +238,7 @@ async def handle_log(request):
     logger.debug("Received /log → returning []")
     return web.json_response([])
 
-# ─── App Entrypoint ───────────────────────────────────────
+# ─────────── Application Entrypoint ───────────
 def main():
     threading.Thread(target=gst_main, daemon=True).start()
     app = web.Application()
